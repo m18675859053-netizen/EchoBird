@@ -1016,6 +1016,62 @@ fn restore_opencode_to_official() -> ApplyResult {
 /// Failures (missing node 24, lock contention, sync bug) are logged but
 /// don't fail apply_codex — the model is still applied, only history
 /// retag is skipped.
+fn resolve_node_binary() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = Vec::new();
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            candidates.push(
+                std::path::PathBuf::from(program_files)
+                    .join("nodejs")
+                    .join("node.exe"),
+            );
+        }
+        if let Ok(program_w6432) = std::env::var("ProgramW6432") {
+            candidates.push(
+                std::path::PathBuf::from(program_w6432)
+                    .join("nodejs")
+                    .join("node.exe"),
+            );
+        }
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            candidates.push(
+                std::path::PathBuf::from(&local_appdata)
+                    .join("Programs")
+                    .join("nodejs")
+                    .join("node.exe"),
+            );
+            candidates.push(
+                std::path::PathBuf::from(local_appdata)
+                    .join("OpenAI")
+                    .join("Codex")
+                    .join("bin")
+                    .join("node.exe"),
+            );
+        }
+        if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+            return path;
+        }
+    }
+
+    std::path::PathBuf::from("node")
+}
+
+fn node_compatible_path(path: &Path) -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+
+    path.to_path_buf()
+}
+
 fn run_codex_provider_sync(provider_id: &str) {
     use std::process::Command;
 
@@ -1046,12 +1102,19 @@ fn run_codex_provider_sync(provider_id: &str) {
         );
         return;
     }
-    log::info!("[codex-sync] cli.js found, proceeding with sync");
+    let cli_js = node_compatible_path(&cli_js);
+    log::info!(
+        "[codex-sync] cli.js found, proceeding with sync: {:?}",
+        cli_js
+    );
 
     // Pre-flight: detect node version. The CLI imports `node:sqlite`
     // which crashes on Node < 24 with a confusing ERR_UNKNOWN_BUILTIN_MODULE.
     // Catch it here and warn-and-skip instead.
-    let mut node_version_cmd = Command::new("node");
+    let node_bin = resolve_node_binary();
+    log::info!("[codex-sync] using node binary: {:?}", node_bin);
+
+    let mut node_version_cmd = Command::new(&node_bin);
     node_version_cmd.arg("--version");
 
     #[cfg(windows)]
@@ -1090,13 +1153,16 @@ fn run_codex_provider_sync(provider_id: &str) {
     // Block until sync finishes, but cap at 10s so a hung child can't
     // freeze the UI forever. Sync is usually <2s on a real user's data,
     // so the 10s ceiling is a safety net, not the common path.
-    let mut cmd = Command::new("node");
+    let codex_home = dirs::home_dir().unwrap_or_default().join(".codex");
+    let mut cmd = Command::new(&node_bin);
     cmd.arg(&cli_js)
         .arg("sync")
         .arg("--provider")
         .arg(provider_id)
         .arg("--keep")
         .arg("5")
+        .arg("--codex-home")
+        .arg(&codex_home)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1109,9 +1175,11 @@ fn run_codex_provider_sync(provider_id: &str) {
     }
 
     log::info!(
-        "[codex-sync] spawning: node {:?} sync --provider {} --keep 5",
+        "[codex-sync] spawning: {:?} {:?} sync --provider {} --keep 5 --codex-home {:?}",
+        node_bin,
         cli_js,
-        provider_id
+        provider_id,
+        codex_home
     );
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -1127,7 +1195,7 @@ fn run_codex_provider_sync(provider_id: &str) {
         provider_id
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1162,7 +1230,7 @@ fn run_codex_provider_sync(provider_id: &str) {
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
-                    log::warn!("[codex-sync] provider sync exceeded 10s, killed");
+                    log::warn!("[codex-sync] provider sync exceeded 30s, killed");
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1221,17 +1289,18 @@ fn kill_codex_if_running() {
         // we want best-effort on both names independently.
         for image in &["Codex.exe", "codex.exe"] {
             let res = std::process::Command::new("taskkill")
-                .args(["/F", "/IM", image])
+                .args(["/F", "/T", "/IM", image])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
             match res {
                 Ok(o) if o.status.success() => {
-                    log::info!("[codex-kill] taskkill /F /IM {} OK", image)
+                    log::info!("[codex-kill] taskkill /F /T /IM {} OK", image)
                 }
                 Ok(_) => { /* exit code 128 = "no such process", expected */ }
                 Err(e) => log::warn!("[codex-kill] taskkill {} failed: {}", image, e),
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(800));
     }
 
     #[cfg(target_os = "macos")]
