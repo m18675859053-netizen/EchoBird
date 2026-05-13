@@ -1,5 +1,5 @@
 {
-  "version": "2.6.3",
+  "version": "2.6.6-patch.1",
   "releaseDate": "2026-05-13",
-  "releaseNotes": "fix: reasoning_content round-trip for thinking models, lock tailwindcss v3, tray minimize support"
+  "releaseNotes": "Fix Codex provider sync Node path handling"
 }
