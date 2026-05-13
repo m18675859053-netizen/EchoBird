@@ -1476,6 +1476,10 @@ fn read_codex_auth_key(codex_dir: &Path) -> Option<String> {
 }
 
 fn restore_codex_to_official(tool_id: &str, config_path: &Path) -> ApplyResult {
+    // Match apply_codex: Codex caches config/auth at startup, and its
+    // state_5.sqlite WAL lock blocks provider-sync while the app is open.
+    kill_codex_if_running();
+
     let mut content = fs::read_to_string(config_path).unwrap_or_default();
     content = toml_write_top(&content, "model_provider", "openai");
     content = toml_write_top(&content, "model", "gpt-4o");
@@ -1512,6 +1516,12 @@ fn restore_codex_to_official(tool_id: &str, config_path: &Path) -> ApplyResult {
             if relay_path.exists() {
                 let _ = fs::remove_file(&relay_path);
             }
+
+            // Restore visibility of sessions that were retagged to an
+            // EchoBird provider. Without this, Codex is back on `openai`
+            // but the history list still filters those sessions out.
+            run_codex_provider_sync("openai");
+
             ApplyResult {
                 success: true,
                 message: format!(
